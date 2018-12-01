@@ -15,6 +15,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #include <zephyr.h>
 #include <kernel.h>
 #include <device.h>
+#include <assert.h>
 #include <init.h>
 #include <irq.h>
 #include <net/ieee802154_radio.h>
@@ -68,9 +69,12 @@ struct efr32_context
 
 	u16_t rx_buf_size;
 
+	int err;
+
     K_THREAD_STACK_MEMBER(rx_stack,
                           CONFIG_IEEE802154_EFR32_RX_STACK_SIZE);
     struct k_thread rx_thread;
+
 
     /* CCA complete sempahore. Unlocked when CCA is complete. */
     struct k_sem cca_wait;
@@ -83,14 +87,9 @@ struct efr32_context
 	 */
     struct k_sem tx_wait;
 
-    /* TX result. Set to 1 on success, 0 otherwise. */
-    bool tx_success;
-
     u8_t channel;
 
     RAIL_Handle_t rail_handle;
-
-	RAIL_RxPacketHandle_t packet_handle;
 };
 
 static struct efr32_context efr32_data;
@@ -330,9 +329,7 @@ static int efr32_tx(struct device *dev, struct net_pkt *pkt,
     RAIL_TxOptions_t tx_opts = RAIL_TX_OPTIONS_NONE;
     RAIL_Status_t status;
 
-    LOG_DBG("rx %p (%u)", payload, payload_len);
-
-    efr32->tx_success = false;
+    LOG_DBG("TX %p (%u)", payload, payload_len);
 
     memcpy(efr32->tx_buf + 1, payload, payload_len);
     efr32->tx_buf[0] = payload_len + EFR32_FCS_LENGTH;
@@ -355,18 +352,15 @@ static int efr32_tx(struct device *dev, struct net_pkt *pkt,
 
     LOG_DBG("Sending frame: channel=%d, written=%u", efr32->channel, written);
 
-	k_sem_give(&efr32->rx_wait);
-#if 1
     if (k_sem_take(&efr32->tx_wait, ACK_TIMEOUT))
     {
         LOG_DBG("ACK not received");
         return -EIO;
     }
-#endif
 
-    LOG_DBG("Result: %d", efr32->tx_success);
+    LOG_DBG("Result: %d", efr32->err);
 
-    return efr32->tx_success ? 0 : -EBUSY;
+    return efr32->err;
 }
 
 /* 
@@ -374,6 +368,12 @@ static int efr32_tx(struct device *dev, struct net_pkt *pkt,
 */
 static void efr32_rx(int arg)
 {
+	RAIL_RxPacketHandle_t packet_handle;
+	RAIL_RxPacketInfo_t packet_info;
+	RAIL_RxPacketDetails_t packet_details;
+	RAIL_Status_t status;
+	u16_t len;
+
     struct device *dev = INT_TO_POINTER(arg);
     struct efr32_context *efr32 = dev->driver_data;
 
@@ -382,10 +382,39 @@ static void efr32_rx(int arg)
         LOG_DBG("Waiting for frame");
         k_sem_take(&efr32->rx_wait, K_FOREVER);
 
-		LOG_DBG("Frame received!");
+		if (efr32->err) {
+			LOG_ERR("RX error: %d", efr32->err);
 
-        RAIL_Idle(efr32->rail_handle, RAIL_IDLE_ABORT, true);
-        RAIL_StartRx(efr32->rail_handle, efr32->channel, NULL);
+			continue;
+		}
+
+		packet_handle = RAIL_GetRxPacketInfo(efr32->rail_handle,
+				RAIL_RX_PACKET_HANDLE_OLDEST, &packet_info);
+
+		packet_details.timeReceived.timePosition = RAIL_PACKET_TIME_INVALID;
+		packet_details.timeReceived.totalPacketBytes = 0;
+
+		status = RAIL_GetRxPacketDetails(efr32->rail_handle, packet_handle, &packet_details);
+		if (status != RAIL_STATUS_NO_ERROR) {
+			LOG_ERR("Failed to get packet details (err = %d)", status);
+			continue;
+		}
+
+		len = packet_info.packetBytes + 1;
+
+		LOG_DBG("Received %u bytes", len);
+
+
+		if(packet_details.isAck)
+		{
+			k_sem_give(&efr32->tx_wait);
+		}
+
+
+		if(packet_handle != RAIL_RX_PACKET_HANDLE_INVALID)
+		{
+			RAIL_ReleaseRxPacket(efr32->rail_handle, packet_handle);
+		}
     }
 }
 
@@ -407,11 +436,18 @@ static int efr32_init(struct device *dev)
     RAIL_TxPowerConfig_t txPowerConfig = {RAIL_TX_POWER_MODE_2P4_HP, 1800, 10};
 
     efr32->rail_handle = RAIL_Init(&s_rail_config, NULL);
-	efr32->packet_handle = RAIL_RX_PACKET_HANDLE_INVALID;
 	efr32->rx_buf_size = sizeof(efr32->rx_buf);
+	efr32->err = 0;
 
-    k_sem_init(&efr32->rx_wait, 0, 1);
+	/* Initialize interrupts */
+
+	IRQ_DIRECT_CONNECT(1, 2, FRC_PRI_IRQHandler, 0);
+	IRQ_DIRECT_CONNECT(4, 2, FRC_IRQHandler, 0);
+	IRQ_DIRECT_CONNECT(8, 2, BUFC_IRQHandler, 0);
+	IRQ_DIRECT_CONNECT(29, 2, PROTIMER_IRQHandler, 0);
+
     k_sem_init(&efr32->tx_wait, 0, 1);
+    k_sem_init(&efr32->rx_wait, 0, 1);
 
     if (efr32->rail_handle == NULL)
     {
@@ -425,7 +461,6 @@ static int efr32_init(struct device *dev)
         LOG_ERR("Error with config data.");
         return -EIO;
     }
-
 
     status = RAIL_ConfigCal(efr32->rail_handle, RAIL_CAL_ALL);
     if (status != RAIL_STATUS_NO_ERROR)
@@ -478,62 +513,75 @@ static int efr32_init(struct device *dev)
 
     efr32_set_txpower(dev, 0);
 
-    k_thread_create(&efr32->rx_thread, efr32->rx_stack,
-                    CONFIG_IEEE802154_EFR32_RX_STACK_SIZE,
-                    (k_thread_entry_t)efr32_rx,
-                    dev, NULL, NULL, K_PRIO_COOP(2), 0, 0);
+	k_thread_create(&efr32->rx_thread, efr32->rx_stack,
+			CONFIG_IEEE802154_EFR32_RX_STACK_SIZE,
+			(k_thread_entry_t)efr32_rx,
+			dev, NULL, NULL, K_PRIO_COOP(2), 0, 0);
 
     LOG_DBG("Init done!");
     return 0;
 }
 
-static void efr32_received()
-{
-    // RAIL_RxPacketHandle_t packetHandle = RAIL_RX_PACKET_HANDLE_INVALID;
-    // RAIL_RxPacketInfo_t packetInfo;
-    // RAIL_RxPacketDetails_t packetDetails;
-
-    // RAIL_Status_t status;
-    // uint16_t length;
-
-    // packetHandle = RAIL_GetRxPacketInfo(efr32_data.rail_handle, RAIL_RX_PACKET_HANDLE_OLDEST, &packetInfo);
-}
-
 static void efr32_rail_cb(RAIL_Handle_t rail_handle, RAIL_Events_t events)
 {
+	struct efr32_context *efr32 = &efr32_data; // FIXME: Not valid
+
     LOG_DBG("Processing events 0x%llX", events);
 
-	if (events & RAIL_EVENT_RX_PACKET_RECEIVED) {
-		LOG_DBG("Received packet frame");
-		efr32_received();
-	}
-	if (events & RAIL_EVENT_RX_PACKET_ABORTED) {
-		LOG_DBG("RX packet aborted");
-	}
-	if (events & RAIL_EVENT_RX_FRAME_ERROR) {
-		LOG_DBG("RX frame error");
-	}
-	if (events & RAIL_EVENT_RX_FIFO_OVERFLOW) {
-		LOG_DBG("RX FIFO overflow");
-	}
-	if (events & RAIL_EVENT_RX_ADDRESS_FILTERED) {
-		LOG_DBG("RX Address filtered");
+	if (events & RAIL_EVENTS_RX_COMPLETION) {
+		if (events & RAIL_EVENT_RX_PACKET_RECEIVED) {
+
+			LOG_DBG("Received packet frame");
+
+			RAIL_HoldRxPacket(rail_handle);
+			efr32->err = 0;
+		}
+		if (events & RAIL_EVENT_RX_PACKET_ABORTED) {
+
+			LOG_DBG("RX packet aborted");
+			efr32->err = -ECONNABORTED;
+		}
+		if (events & RAIL_EVENT_RX_FRAME_ERROR) {
+
+			LOG_DBG("RX frame error");
+			efr32->err = -EIO;
+		}
+		if (events & RAIL_EVENT_RX_FIFO_OVERFLOW) {
+
+			LOG_DBG("RX FIFO overflow");
+			efr32->err = -EIO;
+		}
+		if (events & RAIL_EVENT_RX_ADDRESS_FILTERED) {
+			LOG_DBG("RX Address filtered");
+
+			efr32->err = -EFAULT;
+		}
+
+		k_sem_give(&efr32->rx_wait);
 	}
 
 	if (events & RAIL_EVENT_TX_PACKET_SENT) {
+
+		efr32->err = 0;
 		LOG_DBG("TX packet sent");
 	}
 	if (events & RAIL_EVENT_TX_ABORTED) {
+
 		LOG_DBG("TX was aborted");
+		efr32->err = -ECONNABORTED;
 	}
 	if (events & RAIL_EVENT_TX_BLOCKED) {
 		LOG_DBG("TX is blocked");
 	}
 	if (events & RAIL_EVENT_TX_UNDERFLOW) {
-		LOG_DBG("TX is underflow");
+
+		LOG_DBG("TX underflow");
+		efr32->err = -EIO;
 	}
 	if (events & RAIL_EVENT_TX_CHANNEL_BUSY) {
+
 		LOG_DBG("TX channel busy");
+		efr32->err = -EBUSY;
 	}
 
 	if (events & RAIL_EVENT_TXACK_PACKET_SENT) {
@@ -564,6 +612,8 @@ static void efr32_rail_cb(RAIL_Handle_t rail_handle, RAIL_Events_t events)
 	}
 	if (events & RAIL_EVENT_IEEE802154_DATA_REQUEST_COMMAND) {
 		LOG_DBG("IEEE802154 Data request command");
+
+		//ieee802154DataRequestCommand(rail_handle);
 	}
 }
 
