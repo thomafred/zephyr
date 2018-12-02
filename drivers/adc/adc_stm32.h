@@ -3,8 +3,8 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-#ifndef STM32F4_ADC_H_
-#define STM32F4_ADC_H_
+#ifndef STM32_ADC_H_
+#define STM32_ADC_H_
 
 #include <zephyr/types.h>
 #include <adc.h>
@@ -76,10 +76,10 @@ typedef struct adc_drvData {
 //
 // @return Integer: 0 for success, error otherwise.
 //
-int adc_stm32f4_init(struct device *dev);
+int adc_stm32_init(struct device *dev);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif  /*  STM32F4_ADC_H_ */
+#endif /*  STM32_ADC_H_ */
