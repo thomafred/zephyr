@@ -28,6 +28,14 @@
 	};
 
 	soc {
+		adc0: adc@40007000 {
+			compatible = "st,stm32l0";
+			reg = <0x40007000 0x1000>;
+			interrupts = <7 1>;
+			status = "ok";
+			label = "ADC_0";
+		};
+
 		flash-controller@40022000 {
 			compatible = "st,stm32l0-flash-controller";
 			label = "FLASH_CTRL";
