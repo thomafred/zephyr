@@ -6,15 +6,15 @@
 
 #include <errno.h>
 
-#include <board.h>
+// #include <board.h>
 #include <adc.h>
 #include <device.h>
 #include <kernel.h>
 #include <init.h>
 
-#define SYS_LOG_DOMAIN "SMT32_ADC"
-#define SYS_LOG_LEVEL CONFIG_SYS_LOG_ADC_LEVEL
-#include <logging/sys_log.h>
+#define LOG_LEVEL CONFIG_ADC_LOG_LEVEL
+#include <logging/log.h>
+LOG_MODULE_REGISTER(adc_stm32);
 
 #include <clock_control/stm32_clock_control.h>
 
@@ -23,7 +23,7 @@
 #include <stm32l0xx_hal_adc.h>
 #include <stm32l0xx_hal_adc_ex.h>
 #include <stm32l0xx_hal_cortex.h>
-#else defined(CONFIG_SERIES_STM32FX)
+#elif CONFIG_SERIES_STM32F4X
 #include <stm32f4xx_hal.h>
 #include <stm32f4xx_hal_adc.h>
 #include <stm32f4xx_hal_adc_ex.h>
@@ -65,7 +65,7 @@ static void adc_stm32_enable(struct device *dev)
 {
 	const struct adc_config *config = dev->config->config_info;
 
-	SYS_LOG_DBG("adc%u enable", (unsigned int)config->adcDevNum);
+	LOG_DBG("adc%u enable", (unsigned int)config->adcDevNum);
 }
 
 static void adc_stm32_disable(struct device *dev)
@@ -73,7 +73,7 @@ static void adc_stm32_disable(struct device *dev)
 	const struct adc_config *config = dev->config->config_info;
 	struct adc_drvData *drvData = dev->driver_data;
 
-	SYS_LOG_DBG("adc%u disable", (unsigned int)config->adcDevNum);
+	LOG_DBG("adc%u disable", (unsigned int)config->adcDevNum);
 	HAL_ADC_Stop_IT(&drvData->hadc);
 }
 
@@ -89,7 +89,7 @@ static int adc_stm32_read(struct device *dev, struct adc_seq_table *seq_tbl)
 	int rc;
 
 	rc = stm32adcError_None;
-	SYS_LOG_DBG("adc%u conversion", (unsigned int)config->adcDevNum);
+	LOG_DBG("adc%u conversion", (unsigned int)config->adcDevNum);
 	k_sem_take(&ADCcontrol.adcReadSem, K_FOREVER);
 	ADCcontrol.actDrv = drvData;
 	// ok let's read for once the values
@@ -135,7 +135,7 @@ int adc_stm32_cfgChannel(ADC_HandleTypeDef *phadc, uint32_t c, uint32_t r)
 	GPIO_InitTypeDef gpioCfg;
 	GPIO_TypeDef *GPIOport;
 
-	SYS_LOG_DBG("try to config adc channel %u (rank=%u) ...", c, r);
+	LOG_DBG("Try to config adc channel %u (rank=%u) ...", c, r);
 
 	cfg.Rank = r;
 	cfg.SamplingTime = ADC_SAMPLETIME_480CYCLES;
@@ -251,10 +251,10 @@ int adc_stm32_cfgChannel(ADC_HandleTypeDef *phadc, uint32_t c, uint32_t r)
 		HAL_GPIO_Init(GPIOport, &gpioCfg);
 
 	if (HAL_ADC_ConfigChannel(phadc, &cfg) != HAL_OK) {
-		SYS_LOG_ERR("config adc channel failed");
+		LOG_ERR("config adc channel failed");
 		return stm32adcError_adcHALconfigChannel;
 	}
-	SYS_LOG_DBG("internal adc channel %u has been configured", cfg.Channel);
+	LOG_DBG("internal adc channel %u has been configured", cfg.Channel);
 
 	return stm32adcError_None;
 }
@@ -267,7 +267,7 @@ int adc_stm32_init(struct device *dev)
 	uint32_t r;
 	uint32_t activeChannels;
 
-	SYS_LOG_INF("init adc%u", (unsigned int)config->adcDevNum);
+	LOG_INF("init adc%u", (unsigned int)config->adcDevNum);
 
 	// init adc control structure
 	if (!ADCcontrol.initFlag) {
@@ -308,7 +308,7 @@ int adc_stm32_init(struct device *dev)
 		break;
 #endif
 	default:
-		SYS_LOG_ERR("unknown ADC unit");
+		LOG_ERR("unknown ADC unit");
 		return stm32adcError_UnknownADCunit;
 	}
 
@@ -329,12 +329,12 @@ int adc_stm32_init(struct device *dev)
 			drvData->hadc.Init.NbrOfConversion++;
 		activeChannels >>= 1;
 	}
-	SYS_LOG_INF("use %u multiplexed channels",
+	LOG_INF("use %u multiplexed channels",
 		    (unsigned int)drvData->hadc.Init.NbrOfConversion);
 
 	// start the adc
 	if (HAL_ADC_Init(&drvData->hadc) != HAL_OK) {
-		SYS_LOG_ERR("HAL ADC init failed");
+		LOG_ERR("HAL ADC init failed");
 		return stm32adcError_adcHALinit;
 	}
 
@@ -346,11 +346,11 @@ int adc_stm32_init(struct device *dev)
 		if (activeChannels & 1) {
 			if (adc_stm32_cfgChannel(&drvData->hadc, (uint32_t)i,
 						 r)) {
-				SYS_LOG_ERR("activate adc channel %u failed",
+				LOG_ERR("activate adc channel %u failed",
 					    i);
 				return stm32adcError_configChannel;
 			} else {
-				SYS_LOG_INF("activate adc channel %u", i);
+				LOG_INF("activate adc channel %u", i);
 			}
 			r++;
 		}

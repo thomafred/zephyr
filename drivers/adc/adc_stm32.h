@@ -37,7 +37,9 @@ typedef enum adcChannels {
 	adcChannel_15 = ADC_CHANNEL_15,
 	adcChannel_temp = ADC_CHANNEL_TEMPSENSOR, // 16
 	adcChannel_vref = ADC_CHANNEL_VREFINT, // 17
+#if defined(CONFIG_SOC_SERIES_STM32F4X)
 	adcChannel_vbat = ADC_CHANNEL_VBAT, // 18
+#endif
 	adcChannel_max,
 	adcChannel_unused,
 } adc_channel_index_t;
