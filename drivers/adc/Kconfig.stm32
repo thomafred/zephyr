@@ -158,6 +158,7 @@ if ADC_STM32
 			bool "channel 18 (VBat)"
 			default n
 			depends on ADC_0
+			depends on SOC_SERIES_STM32F4X
 			help
 				Enables ADC voltage battery channel
 	endmenu
