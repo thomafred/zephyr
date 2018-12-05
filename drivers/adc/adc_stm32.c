@@ -12,6 +12,8 @@
 #include <kernel.h>
 #include <init.h>
 
+#include "adc_context.h"
+
 #define LOG_LEVEL CONFIG_ADC_LOG_LEVEL
 #include <logging/log.h>
 LOG_MODULE_REGISTER(adc_stm32);
@@ -19,34 +21,124 @@ LOG_MODULE_REGISTER(adc_stm32);
 #include <clock_control/stm32_clock_control.h>
 
 #ifdef CONFIG_SOC_SERIES_STM32L0X
+#include <stm32l0xx.h>
 #include <stm32l0xx_hal.h>
 #include <stm32l0xx_hal_adc.h>
 #include <stm32l0xx_hal_adc_ex.h>
 #include <stm32l0xx_hal_cortex.h>
 #elif defined(CONFIG_SOC_SERIES_STM32F4X)
+#include <stm32f4xx.h>
 #include <stm32f4xx_hal.h>
 #include <stm32f4xx_hal_adc.h>
 #include <stm32f4xx_hal_adc_ex.h>
 #include <stm32f4xx_hal_cortex.h>
 #endif
 
-#include "adc_stm32.h"
+struct adc_stm32_data {
 
-typedef struct adc_stm32_control {
-	int init_flag;
-	int isr_connected_flag;
-	struct k_sem adc_read_lock;
-	struct adc_drv_data_t *act_drv;
-	struct k_msgq adc_vals;
-	uint16_t adc_val_buff[adc_channel_max];
-} adc_control_t;
+	struct adc_context ctx;
+	u16_t *buffer;
+	u32_t active_channels;
 
-static adc_control_t adc_control = {
-	.init_flag = 0,
-	.isr_connected_flag = 0,
-	.act_drv = NULL
+	const struct adc_sequence *entries;
+	u8_t seq_size;
+	u8_t resolution;
+	u32_t channels;
+
+	volatile ADC_TypeDef *Instance;
 };
 
+struct adc_stm32_config {
+	volatile ADC_TypeDef *reg_base;
+};
+
+static int adc_stm32_adc_enable(struct device *dev)
+{
+	struct adc_stm32_data *data = dev->driver_data;
+	volatile ADC_TypeDef *adc = data->Instance;
+
+	int retries = ADC_ENABLE_TIMEOUT;
+
+	if (ADC_ENABLING_CONDITIONS(data) == RESET) {
+		return -EINVAL;
+	}
+
+	__HAL_ADC_ENABLE(data);
+
+	do {
+		k_sleep(1);
+		
+		if (__HAL_ADC_GET_FLAG(data, ADC_FLAG_RDY) == RESET) {
+			break;
+		}
+	} while(--retries);
+
+	return retries ? 0 : -EFAULT;
+}
+
+static void adc_stm32_start_conversion(struct device *dev)
+{
+	struct adc_stm32_data *data = dev->driver_data;
+	const struct adc_sequence *entry = data->ctx.sequence;
+	u32_t interval_us = 0;
+
+	if (entry->options) {
+		interval_us = entry->options->interval_us;
+	}
+
+	/* Setup sequence */
+
+	if (ADC_IS_CONVERSION_ONGOING_REGULAR(data) == RESET) {
+		
+		data->Instance->CR |= ADC_CR_ADSTART;
+	}
+
+	return 0;
+}
+
+static int adc_stm32_read_request(struct device *dev, const struct adc_sequence *seq_tbl)
+{
+	struct adc_stm32_data *data = dev->driver_data;
+	int err;
+
+	/* Ensure resolution is valid */
+
+	data->channels = seq_tbl->channels & data->active_channels;
+	if (data->channels != seq_tbl->channels) {
+		return -EINVAL;
+	}
+
+	switch (seq_tbl->resolution) {
+	case 6:
+	case 8:
+	case 10:
+	case 12:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	data->entries = seq_tbl;
+	data->buffer = (u16_t*) seq_tbl->buffer;
+
+	if (seq_tbl->options) {
+		data->seq_size = seq_tbl->options->extra_samplings + 1;
+	} else {
+		data->seq_size = 1;
+	}
+
+	/* Assert FIFO length */
+
+	/* Check if buffer has enough size */
+
+	adc_context_start_read(&data->ctx, seq_tbl);
+	err = adc_context_wait_for_completion(&data->ctx);
+	adc_context_release(&data->ctx, err);
+
+	return err;
+}
+
+#if 0
 ISR_DIRECT_DECLARE(ADC_IRQHandler)
 {
 	HAL_ADC_IRQHandler(&adc_control.act_drv->hadc);
@@ -60,11 +152,35 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 	v = (uint16_t)HAL_ADC_GetValue(hadc);
 	k_msgq_put(&adc_control.adc_vals, &v, K_NO_WAIT);
 }
+#endif
 
-#define ADC_STM32_SETBITMASK(bit) (1 << (bit))
+/********************************************
+ *********** ADC context-functions **********
+ ********************************************/
 
-static int adc_stm32_read(struct device *dev, const struct adc_sequence *seq_tbl)
+static void adc_context_start_sampling(struct adc_context *ctx)
 {
+
+}
+
+static void adc_context_update_buffer_pointer(struct adc_context *ctx, bool repeat)
+{
+
+}
+
+/********************************************
+ ******************* API ********************
+ ********************************************/
+
+static int adc_stm32_read(struct device *dev, const struct adc_sequence *sequence)
+{
+	struct adc_stm32_data *data = dev->driver_data;
+
+	adc_context_lock(&data->ctx, false, NULL);
+
+	return adc_stm32_read_request(dev, sequence);
+}
+#if 0
 	struct adc_drv_data *drv_data = dev->driver_data;
 	const struct adc_config *config = dev->config->config_info;
 
@@ -109,10 +225,26 @@ error:
 	k_sem_give(&adc_control.adc_read_lock);
 	return rc;
 }
+#endif
+
+#ifdef CONFIG_ADC_ASYNC
+static int adc_stm32_read_async(struct device *dev,
+		const struct adc_sequence *sequence, struct k_poll_signal *async)
+{
+	struct adc_stm32_data *data = dev->driver_data;
+
+	adc_context_lock(&data->ctx, true, async);
+
+	return adc_stm32_read_request(dev, sequence);
+}
+#endif
 
 int adc_stm32_cfg_channel(struct device *dev,
 				    const struct adc_channel_cfg *channel_cfg)
 {
+
+}
+#if 0
 	ADC_ChannelConfTypeDef cfg;
 	GPIO_InitTypeDef gpio_cfg;
 	GPIO_TypeDef *gpio_port;
@@ -252,9 +384,15 @@ int adc_stm32_cfg_channel(struct device *dev,
 
 	return stm32adc_error_none;
 }
+#endif
+
+/********************************************
+ ****************** INIT ********************
+ ********************************************/
 
 static int adc_stm32_init(struct device *dev)
 {
+#if 0
 	const struct adc_config *config = dev->config->config_info;
 	struct adc_drv_data *drv_data = dev->driver_data;
 	uint32_t active_channels;
@@ -354,6 +492,10 @@ static int adc_stm32_init(struct device *dev)
 	// }
 
 	return stm32adc_error_none;
+
+#endif
+
+	return 0;
 }
 
 static struct adc_driver_api api_stm32_driver_api = {
@@ -372,61 +514,61 @@ static struct adc_config adc_config_dev0 = {
 	.adc_dev_num = 0,
 	.active_channels = 0
 #ifdef CONFIG_ADC0_CHAN0
-			  + ADC_STM32_SETBITMASK(adc_channel_0)
+			  + BIT(adc_channel_0)
 #endif
 #ifdef CONFIG_ADC0_CHAN1
-			  + ADC_STM32_SETBITMASK(adc_channel_1)
+			  + BIT(adc_channel_1)
 #endif
 #ifdef CONFIG_ADC0_CHAN2
-			  + ADC_STM32_SETBITMASK(adc_channel_2)
+			  + BIT(adc_channel_2)
 #endif
 #ifdef CONFIG_ADC0_CHAN3
-			  + ADC_STM32_SETBITMASK(adc_channel_3)
+			  + BIT(adc_channel_3)
 #endif
 #ifdef CONFIG_ADC0_CHAN4
-			  + ADC_STM32_SETBITMASK(adc_channel_4)
+			  + BIT(adc_channel_4)
 #endif
 #ifdef CONFIG_ADC0_CHAN5
-			  + ADC_STM32_SETBITMASK(adc_channel_5)
+			  + BIT(adc_channel_5)
 #endif
 #ifdef CONFIG_ADC0_CHAN6
-			  + ADC_STM32_SETBITMASK(adc_channel_6)
+			  + BIT(adc_channel_6)
 #endif
 #ifdef CONFIG_ADC0_CHAN7
-			  + ADC_STM32_SETBITMASK(adc_channel_7)
+			  + BIT(adc_channel_7)
 #endif
 #ifdef CONFIG_ADC0_CHAN8
-			  + ADC_STM32_SETBITMASK(adc_channel_8)
+			  + BIT(adc_channel_8)
 #endif
 #ifdef CONFIG_ADC0_CHAN9
-			  + ADC_STM32_SETBITMASK(adc_channel_9)
+			  + BIT(adc_channel_9)
 #endif
 #ifdef CONFIG_ADC0_CHAN10
-			  + ADC_STM32_SETBITMASK(adc_channel_10)
+			  + BIT(adc_channel_10)
 #endif
 #ifdef CONFIG_ADC0_CHAN11
-			  + ADC_STM32_SETBITMASK(adc_channel_11)
+			  + BIT(adc_channel_11)
 #endif
 #ifdef CONFIG_ADC0_CHAN12
-			  + ADC_STM32_SETBITMASK(adc_channel_12)
+			  + BIT(adc_channel_12)
 #endif
 #ifdef CONFIG_ADC0_CHAN13
-			  + ADC_STM32_SETBITMASK(adc_channel_13)
+			  + BIT(adc_channel_13)
 #endif
 #ifdef CONFIG_ADC0_CHAN14
-			  + ADC_STM32_SETBITMASK(adc_channel_14)
+			  + BIT(adc_channel_14)
 #endif
 #ifdef CONFIG_ADC0_CHAN15
-			  + ADC_STM32_SETBITMASK(adc_channel_15)
+			  + BIT(adc_channel_15)
 #endif
 #ifdef CONFIG_ADC0_CHAN_TEMP
-			  + ADC_STM32_SETBITMASK(adc_channel_temp)
+			  + BIT(adc_channel_temp)
 #endif
 #ifdef CONFIG_ADC0_CHAN_VREFINT
-			  + ADC_STM32_SETBITMASK(adc_channel_vref)
+			  + BIT(adc_channel_vref)
 #endif
 #ifdef CONFIG_ADC0_CHAN_VBAT && defined(CONFIG_SERIES_STM32F4X)
-			  + ADC_STM32_SETBITMASK(adc_channel_vbat)
+			  + BIT(adc_channel_vbat)
 #endif
 		,
 };
@@ -444,61 +586,61 @@ static struct adc_config adc_config_dev1 = {
 	.adc_dev_num = 0,
 	.active_channels = 0
 #ifdef CONFIG_ADC1_CHAN0
-			  + ADC_STM32_SETBITMASK(adc_channel_0)
+			  + BIT(adc_channel_0)
 #endif
 #ifdef CONFIG_ADC1_CHAN1
-			  + ADC_STM32_SETBITMASK(adc_channel_1)
+			  + BIT(adc_channel_1)
 #endif
 #ifdef CONFIG_ADC1_CHAN2
-			  + ADC_STM32_SETBITMASK(adc_channel_2)
+			  + BIT(adc_channel_2)
 #endif
 #ifdef CONFIG_ADC1_CHAN3
-			  + ADC_STM32_SETBITMASK(adc_channel_3)
+			  + BIT(adc_channel_3)
 #endif
 #ifdef CONFIG_ADC1_CHAN4
-			  + ADC_STM32_SETBITMASK(adc_channel_4)
+			  + BIT(adc_channel_4)
 #endif
 #ifdef CONFIG_ADC1_CHAN5
-			  + ADC_STM32_SETBITMASK(adc_channel_5)
+			  + BIT(adc_channel_5)
 #endif
 #ifdef CONFIG_ADC1_CHAN6
-			  + ADC_STM32_SETBITMASK(adc_channel_6)
+			  + BIT(adc_channel_6)
 #endif
 #ifdef CONFIG_ADC1_CHAN7
-			  + ADC_STM32_SETBITMASK(adc_channel_7)
+			  + BIT(adc_channel_7)
 #endif
 #ifdef CONFIG_ADC1_CHAN8
-			  + ADC_STM32_SETBITMASK(adc_channel_8)
+			  + BIT(adc_channel_8)
 #endif
 #ifdef CONFIG_ADC1_CHAN9
-			  + ADC_STM32_SETBITMASK(adc_channel_9)
+			  + BIT(adc_channel_9)
 #endif
 #ifdef CONFIG_ADC1_CHAN10
-			  + ADC_STM32_SETBITMASK(adc_channel_10)
+			  + BIT(adc_channel_10)
 #endif
 #ifdef CONFIG_ADC1_CHAN11
-			  + ADC_STM32_SETBITMASK(adc_channel_11)
+			  + BIT(adc_channel_11)
 #endif
 #ifdef CONFIG_ADC1_CHAN12
-			  + ADC_STM32_SETBITMASK(adc_channel_12)
+			  + BIT(adc_channel_12)
 #endif
 #ifdef CONFIG_ADC1_CHAN13
-			  + ADC_STM32_SETBITMASK(adc_channel_13)
+			  + BIT(adc_channel_13)
 #endif
 #ifdef CONFIG_ADC1_CHAN14
-			  + ADC_STM32_SETBITMASK(adc_channel_14)
+			  + BIT(adc_channel_14)
 #endif
 #ifdef CONFIG_ADC1_CHAN15
-			  + ADC_STM32_SETBITMASK(adc_channel_15)
+			  + BIT(adc_channel_15)
 #endif
 #ifdef CONFIG_ADC1_CHAN_TEMP
-			  + ADC_STM32_SETBITMASK(adc_channel_temp)
+			  + BIT(adc_channel_temp)
 #endif
 #ifdef CONFIG_ADC1_CHAN_VREFINT
-			  + ADC_STM32_SETBITMASK(adc_channel_vref)
+			  + BIT(adc_channel_vref)
 #endif
 #if defined(CONFIG_ADC1_CHAN_VBAT) && defined(CONFIG_SERIES_STM32F4X)
-			  + ADC_STM32_SETBITMASK(adc_channel_vbat)
+			  + BIT(adc_channel_vbat)
 #endif
 		,
 };
@@ -516,37 +658,37 @@ static struct adc_config adc_config_dev2 = {
 	.adc_dev_num = 0,
 	.active_channels = 0
 #ifdef CONFIG_ADC2_CHAN0
-			  + ADC_STM32_SETBITMASK(adc_channel_0)
+			  + BIT(adc_channel_0)
 #endif
 #ifdef CONFIG_ADC2_CHAN1
-			  + ADC_STM32_SETBITMASK(adc_channel_1)
+			  + BIT(adc_channel_1)
 #endif
 #ifdef CONFIG_ADC2_CHAN2
-			  + ADC_STM32_SETBITMASK(adc_channel_2)
+			  + BIT(adc_channel_2)
 #endif
 #ifdef CONFIG_ADC2_CHAN3
-			  + ADC_STM32_SETBITMASK(adc_channel_3)
+			  + BIT(adc_channel_3)
 #endif
 #ifdef CONFIG_ADC2_CHAN10
-			  + ADC_STM32_SETBITMASK(adc_channel_10)
+			  + BIT(adc_channel_10)
 #endif
 #ifdef CONFIG_ADC2_CHAN11
-			  + ADC_STM32_SETBITMASK(adc_channel_11)
+			  + BIT(adc_channel_11)
 #endif
 #ifdef CONFIG_ADC2_CHAN12
-			  + ADC_STM32_SETBITMASK(adc_channel_12)
+			  + BIT(adc_channel_12)
 #endif
 #ifdef CONFIG_ADC2_CHAN13
-			  + ADC_STM32_SETBITMASK(adc_channel_13)
+			  + BIT(adc_channel_13)
 #endif
 #ifdef CONFIG_ADC2_CHAN_TEMP
-			  + ADC_STM32_SETBITMASK(adc_channel_temp)
+			  + BIT(adc_channel_temp)
 #endif
 #ifdef CONFIG_ADC2_CHAN_VREFINT
-			  + ADC_STM32_SETBITMASK(adc_channel_vref)
+			  + BIT(adc_channel_vref)
 #endif
 #ifdef CONFIG_ADC2_CHAN_VABT
-			  + ADC_STM32_SETBITMASK(adc_channel_vbat)
+			  + BIT(adc_channel_vbat)
 #endif
 		,
 };
